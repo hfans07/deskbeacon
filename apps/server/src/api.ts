@@ -1,0 +1,206 @@
+import { createMcpHandler } from "@modelcontextprotocol/server";
+import { McpServer } from "@modelcontextprotocol/server";
+import { toolInputSchemas, TOOL_NAMES, LIMITS, type ToolName } from "@deskbeacon/protocol";
+import type { Env, GrantProps, DeviceRecord } from "./env.js";
+import { executeToolBatch } from '@deskbeacon/protocol';
+import type { BatchInput } from "@deskbeacon/protocol";
+import { resolveActorName } from "./oauth-actor.js";
+import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import {listOwnerGrants,activeDeviceClientIds} from "./device-authorizations.js";
+
+type ApiCtx = ExecutionContext & { props?: GrantProps; auth?: { scope?: string[]; clientId?: string } };
+const scopeAgent = "deskbeacon:agent", scopeDevice = "deskbeacon:device";
+
+async function registry(env: Env, oauth: Pick<OAuthHelpers,"listUserGrants">): Promise<DeviceRecord[]> {
+  const authorized=activeDeviceClientIds(await listOwnerGrants(oauth));
+  if(!authorized.size)return [];
+  const devices: DeviceRecord[] = [];
+  let cursor: string | undefined;
+  do {
+    const keys = await env.OAUTH_KV.list({ prefix: "device:", limit: 250, ...(cursor ? { cursor } : {}) });
+    for (const key of keys.keys) {
+      if(!authorized.has(key.name.slice("device:".length)))continue;
+      const record = await env.OAUTH_KV.get(key.name, "json") as DeviceRecord | null;
+      if (record && record.deviceId && authorized.has(record.deviceId)) devices.push(record);
+    }
+    cursor = keys.list_complete ? undefined : keys.cursor;
+  } while (cursor && devices.length < 2000);
+  return devices;
+}
+
+function secureError(code: string, message: string, operationId?: string): Record<string, unknown> {
+  return { isError: true, code, message, ...(operationId ? { operationId } : {}) };
+}
+
+export async function dispatchTool(env: Env, name: ToolName, input: unknown, grantId: string, actorName?: string, oauth?: Pick<OAuthHelpers,"listUserGrants">): Promise<Record<string,unknown>> {
+  const schema = toolInputSchemas[name];
+  const validated = schema.safeParse(input);
+  if (!validated.success) return secureError("INVALID_INPUT", validated.error.message.slice(0, 1500));
+  const data = validated.data as Record<string, unknown>;
+  if (name === "batch") {
+    const batch = data as unknown as BatchInput;
+    // History is stored by the DO, not on the device. Rare history-containing
+    // batches retain the server orchestrator; commands still use the device pool.
+    if(batch.stages.some(s=>s.calls.some(c=>c.tool==='operation_get'||c.tool==='operation_output')) ||
+       new TextEncoder().encode(JSON.stringify(batch)).byteLength>LIMITS.controlFrameBytes-16_384)
+      return executeToolBatch(batch,(tool,subInput)=>dispatchTool(env,tool,subInput,grantId,actorName,oauth));
+  }
+  if (name === "device_list") {
+    if(!oauth)return secureError("OAUTH_UNAVAILABLE","Cannot verify device grants");
+    const records = await registry(env,oauth);
+    // Check live DO WebSocket state only on Agent demand, never by polling.
+    // Limit concurrent DO calls to keep list operations bounded.
+    const updated: DeviceRecord[] = [];
+    for (let offset = 0; offset < records.length; offset += 8) {
+      const batch = records.slice(offset, offset + 8);
+      updated.push(...await Promise.all(batch.map(async record => {
+        try {
+          const stub = env.DEVICE_SESSIONS.get(env.DEVICE_SESSIONS.idFromName(record.deviceId));
+          const response = await stub.fetch("https://device.internal/status");
+          if (!response.ok) return { ...record, state: "unknown" as const };
+          const state = await response.json() as { online?: boolean };
+          return { ...record, state: state.online ? "online" as const : "offline" as const };
+        } catch {
+          return { ...record, state: "unknown" as const };
+        }
+      })));
+    }
+    return { devices: updated, onlineStatus: "checked on request", offlineHint: "Offline only means no active device WebSocket. Start deskbeacon or deskbeacon service start on that computer; if unreachable, check power and network." };
+  }
+  const deviceId = data.deviceId as string;
+  const stub = env.DEVICE_SESSIONS.get(env.DEVICE_SESSIONS.idFromName(deviceId));
+  const result = await stub.fetch("https://device.internal/rpc", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name, input: data, grantId, actorName, operationId: crypto.randomUUID() }),
+  });
+  const body = await result.json() as Record<string, unknown>;
+  if (name==='batch' && body.status==='completed' && body.data &&
+      typeof body.data==='object' && 'stages' in body.data)
+    return { ...(body.data as Record<string, unknown>), operationId: body.operationId };
+  if (body.isError === true && body.code === "DEVICE_OFFLINE") {
+    return { ...body, nextStep: "The target device has no active WebSocket. On that computer, launch deskbeacon (foreground) or deskbeacon service start (background). Confirm network and power; then retry device_list before retrying the operation." };
+  }
+  return body;
+}
+
+export function makeMcpServer(env: Env, grantId: string, actorName?: string, oauth?: Pick<OAuthHelpers,"listUserGrants">): McpServer {
+  const server = new McpServer({ name: "deskbeacon", version: "0.1.0" });
+  for (const name of TOOL_NAMES) {
+    const schema = toolInputSchemas[name];
+    server.registerTool(name, {
+      description: descriptions[name] ?? name.replaceAll("_", " "),
+      inputSchema: schema as any,
+    }, async (input: any) => {
+      const result = await dispatchTool(env, name, input, grantId, actorName,oauth);
+      const error = result.isError === true;
+      const content: any[] = [];
+      if (!error && name === "screen_capture" && typeof result.data === "object" && result.data &&
+          "base64" in result.data && "mimeType" in result.data) {
+        const data = result.data as { base64: string; mimeType: string };
+        content.push({ type: "image", data: data.base64, mimeType: data.mimeType });
+        const { base64: _, ...meta } = data;
+        content.push({ type: "text", text: JSON.stringify(meta) });
+      } else {
+        content.push({ type: "text", text: JSON.stringify(result) });
+      }
+      // Image payloads must not be duplicated into structuredContent.
+      const structuredContent = !error && name === 'screen_capture' && result.data &&
+        typeof result.data === 'object' && 'base64' in result.data
+        ? {...result,data:Object.fromEntries(Object.entries(result.data).filter(([key])=>key!=='base64'))}
+        : result;
+      return { content, structuredContent, isError: error };
+    });
+  }
+  return server;
+}
+
+const descriptions: Record<string,string> = {
+  desktop_status: "Inspect native Desktop automation status, permissions and supported surfaces. The agent-desktop runtime is loaded only when invoked and only on supported OS/architectures.",
+  desktop_list: "List desktop applications, windows, displays or UI surfaces on the selected device. Read-only; use windows to find a target windowId.",
+  desktop_snapshot: "Read a structured accessibility snapshot. Use compact interactive mode by default; follow @snapshot:eN qualified refs, re-snapshot after UI changes.",
+  desktop_find: "Search accessible UI elements by role/name/text/value and return qualified refs; narrow searches before modifying the UI.",
+  desktop_get: "Read live property or accessibility state for a snapshot-qualified element ref. Unknown is not the same as false.",
+  desktop_click: "Invoke a qualified accessibility ref with a Click/Invoke action; editable text surfaces may not support semantic click, even in headed mode. For such surfaces, obtain bounds and use desktop_pointer action=click with headed permission. Never bypass ref ownership or desktop policy.",
+  desktop_input: "Set, type or clear text on a snapshot-qualified control. set_value changes accessibility state, not necessarily application content: delivery is unverified until independently checked (e.g. screenshot or document read). For Windows rich editors, use headed type/press when appropriate. Do not send passwords unnecessarily.",
+  desktop_wait: "Wait for an element, window, text, menu, event or notification; returns once matched or on deadline. Does not alter the UI.",
+  desktop_control: "Set accessible element state, select, focus, or scroll using snapshot refs; prefer check/uncheck over toggle.",
+  desktop_press: "Send a keyboard shortcut to a chosen app or window. Requires explicit headed mode and device permission.",
+  desktop_pointer: "Physical hover, move, click, drag or mouse-wheel action. Requires headed permission; coordinate actions are invasive.",
+  desktop_app: "Launch or gracefully close a desktop application. Launch accepts bounded launchArgs and workingDirectory for opening specific documents; process launched, window detected and foreground verified are distinct states.",
+  desktop_window: "Focus, move, resize, minimize, maximize, or restore a desktop window. Specify app or windowId.",
+  desktop_session: "Create, inspect, list or end native desktop sessions owned by this OAuth Agent grant within the active daemon runtime. Use action=list to find owned sessions. Another grant cannot end a session; sessions may close when the daemon restarts. Cursor overlays need device opt-in.",
+
+  device_list: "Find paired devices and their current live online/offline state. Call first when deviceId is unknown; records may remain listed while computers are powered off. Do not interpret lastSeenAt as continuous availability.",
+  device_info: "Get a live device capability snapshot, current OS, supported shells, and default working directory. Requires an online device.",
+  workspace_open: "Create or reopen a workspace. An explicit workspaceId is honored, and reopening keeps the original cwd. Shell cd commands do NOT update this context.",
+  workspace_info: "Read Agent-scoped workspace cwd, shell profile and version. Requires workspaceId returned from workspace_open.",
+  workspace_cd: "Change Agent-scoped workspace cwd with optional expectedVersion compare-and-swap. This affects subsequent workspace-aware operations, not the computer's global cwd.",
+  fs_list: "List a bounded directory tree with depth/limit/cursor, sorting and hidden-file options. Prefer it over shell ls for ordinary filesystem discovery.",
+  fs_stat: "Stat up to 100 explicit paths and optionally calculate file hashes. Use before edit when checking for concurrent changes.",
+  fs_read: "Read a bounded file range; prefer lineOffset/maxLines for source code and byteOffset/maxBytes for binary. Returned ranges can be paged; never assume a preview is the complete file.",
+  fs_read_many: "Read up to 8 source files in one MCP request, with per-file line/byte bounds, per-file errors and continuations, optional SHA-256 and a strict aggregate response budget. Prefer this for multi-file code context instead of many separate fs_read calls.",
+  fs_write: "Create, rewrite or append file content with optional expectedHash and overwrite protection. Prefer expectedHash for sensitive concurrent edits.",
+  fs_edit: "Edit one file atomically. mode=replace: oldText/newText, expectedReplacements defaults to 1; mode=replace_many: replacements array (1-64), validated together before writing; mode=patch: unified diff patch. LF/CRLF-compatible matching preserves the file\u0027s newline style. Use expectedHash to reject stale edits and dryRun to validate without writing. Mismatch errors include counts and candidate line numbers; edits never use fuzzy matching.",
+  fs_manage: "Create directories, copy, move, rename or remove files; destructive actions are explicit. Do not use for archive extraction.",
+  fs_archive: "ZIP/TAR archive operations: action=create needs description, sourcePaths[], outputPath, format; action=list needs archivePath; action=extract needs description, archivePath, targetDirectory. All paths belong to the selected device.",
+  exec_foreground: "Run a finite command and WAIT for exit and output in the SAME MCP call. stdin closes by default; command.stdin supplies input before EOF. Prefer top-level timeoutMs (takes precedence over deprecated command.timeoutMs). No automatic background.",
+  batch: "Compose multiple DeskBeacon tools on ONE device in serial or parallel stages. Independent parallel foreground commands share the device's four execution slots with all Agents; a batch itself occupies no slot. Each nested input matches the standalone tool schema WITHOUT deviceId. failFast stops later stages, not already running parallel calls. Results are bounded and not passed to subsequent stages.",
+  exec_background: "EXPLICITLY start a long-running process, get backgroundTaskId, then poll its output using cursor and stop when done. Never use for ordinary short commands.",
+  background_list: "List local background process records and statuses, including exited tasks.",
+  background_get: "Inspect a specific background task by backgroundTaskId.",
+  background_output: "Retrieve incremental persisted stdout/stderr by cursor without replaying earlier data. Suitable for development server logs.",
+  background_input: "Write input to a running background task, close stdin or send Ctrl+C. Does not spawn a new process.",
+  background_stop: "Stop one specific background task/process tree. Safe to retry; requires backgroundTaskId.",
+  operation_get: "Read metadata and result of a prior foreground operation from bounded durable history; requires operationId.",
+  operation_output: "Page text stdout/stderr from a prior foreground operation by offset. Use when outputPreview is truncated or more detail is needed.",
+  batch_output: "Page local persisted stdout, stderr or result from a batch child call by parentOperationId and callId. Supports truncated outputs; authorization is scoped to the parent grant.",
+  transfer_upload: "Transfer actual bytes supplied by the MCP host from Agent to device. Small inline transfers only unless the Host supports streaming; this tool does NOT fetch arbitrary URLs.",
+  transfer_download: "Download device file content in offset/maxBytes pages (up to 128 KiB each); returns totalBytes, nextOffset, hasMore and page sha256.",
+  transfer_status: "Get status of a specific transferId. Inline transfers may have completed immediately.",
+  transfer_cancel: "Cancel a currently active transfer when supported. Returns a clear reason if no active stream exists.",
+  net_ports: "Inspect local listening ports or connections and owning PIDs on the selected device.",
+  net_probe: "DNS/TCP/TLS connectivity test FROM the device. Specify mode=dns with hostname, or mode=tcp/tls with host (and port for tcp). The mode selects the required parameter names; use http_request for HTTP.",
+  http_request: "Issue bounded HTTP requests FROM the device, including localhost-only APIs. Observe status/headers/body limits. Never send secrets in URL query strings.",
+  system_snapshot: "Read CPU, memory, filesystem, and network system information without mutating the device.",
+  system_processes: "List matching system processes by name or PID; read-only, not a process kill tool.",
+  screen_capture: "Capture screen, monitor or rectangle via existing backend, or app/window via lazily loaded agent-desktop. Returns one image plus metadata; no duplicated Base64 in structuredContent.",
+  fs_find: "Search filenames via ripgrep: pattern accepts a plain substring (e.g. report) or filename glob (e.g. *.txt or test-?.ts), not regular expressions. glob provides additional ripgrep glob filters. includeDirectories includes matching directories, even empty ones. .gitignore works only within Git repositories; use respectIgnore=false to disable ignoring.",
+  fs_grep: "Fast content grep via ripgrep with bounded structured results and truncation metadata.",
+};
+
+export async function handleApiRequest(request: Request, env: Env, ctx: ApiCtx, oauth: Pick<OAuthHelpers, "lookupClient"|"listUserGrants">): Promise<Response> {
+  const pathname = new URL(request.url).pathname;
+  const props = ctx.props;
+  const scopes = ctx.auth?.scope ?? [];
+  if (pathname === "/mcp") {
+    if (props?.kind !== "agent" || !scopes.includes(scopeAgent)) return Response.json({ error: "FORBIDDEN" }, { status: 403 });
+    const grantId = props.grantId;
+    const actorName = await resolveActorName(oauth, props.actorName, ctx.auth?.clientId);
+    const handler = createMcpHandler(() => makeMcpServer(env, grantId, actorName,oauth), { legacy: "stateless" });
+    return handler.fetch(request);
+  }
+  if (pathname === "/device/connect") {
+    if (props?.kind !== "device" || !scopes.includes(scopeDevice)) return Response.json({ error: "FORBIDDEN" }, { status: 403 });
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return Response.json({ error: "WebSocket required" }, { status: 426 });
+    // KV is the source of truth for the user-defined device label.
+    // OAuth grant metadata is only a fallback for devices paired before this registry existed.
+    const key = "device:" + props.deviceId;
+    const existing = await env.OAUTH_KV.get(key, "json") as DeviceRecord | null;
+    const record: DeviceRecord = {
+      ...existing,
+      deviceId: props.deviceId,
+      label: existing?.label || props.deviceName || (await oauth.lookupClient(props.deviceId))?.clientName || "DeskBeacon device",
+      lastSeenAt: new Date().toISOString(),
+      state: "unknown",
+    };
+    await env.OAUTH_KV.put(key, JSON.stringify(record));
+    const stub = env.DEVICE_SESSIONS.get(env.DEVICE_SESSIONS.idFromName(props.deviceId));
+    return stub.fetch(new Request("https://device.internal/connect", { headers: { upgrade: "websocket", "x-device-id": props.deviceId } }));
+  }
+  if (pathname === "/device/info") {
+    if (props?.kind !== "device" || !scopes.includes(scopeDevice)) return Response.json({ error: "FORBIDDEN" }, { status: 403 });
+    const record = await env.OAUTH_KV.get("device:" + props.deviceId, "json") as DeviceRecord | null;
+    return Response.json({ deviceId: props.deviceId, protocolVersion: 1, label: record?.label ?? props.deviceName ?? (await oauth.lookupClient(props.deviceId))?.clientName ?? "DeskBeacon device" });
+  }
+  return new Response("Not found", { status: 404 });
+}

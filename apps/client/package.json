@@ -1,0 +1,58 @@
+{
+  "name": "deskbeacon",
+  "private": true,
+  "version": "0.3.1",
+  "description": "DeskBeacon local companion CLI and Ink TUI for Agent-controlled devices",
+  "type": "module",
+  "bin": {
+    "deskbeacon": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "build:native:win-x64": "node scripts/build-native.mjs win32-x64",
+    "verify:native:win-x64": "node scripts/verify-native.mjs win32-x64",
+    "demo": "pnpm build && node dist/index.js demo",
+    "build:native:win-arm64": "node scripts/build-native.mjs win32-arm64",
+    "verify:native:win-arm64": "node scripts/verify-native.mjs win32-arm64"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.6.0",
+    "@types/cross-spawn": "^6.0.6",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/screenshot-desktop": "^1.15.0",
+    "@types/tar": "^7.0.87",
+    "@types/ws": "^8.18.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^6.0.0"
+  },
+  "dependencies": {
+    "@deskbeacon/protocol": "workspace:*",
+    "@vscode/ripgrep": "^1.18.0",
+    "adm-zip": "^0.6.1",
+    "cross-spawn": "^7.0.6",
+    "diff": "^9.0.0",
+    "highlight.js": "11.11.1",
+    "ink": "^7.1.1",
+    "node-fetch": "^3.3.2",
+    "proxy-agent": "^8.0.2",
+    "react": "^19.3.1",
+    "rlog-js": "^3.1.0",
+    "screenshot-desktop": "^1.15.7",
+    "sharp": "^0.35.5",
+    "string-width": "8.3.0",
+    "systeminformation": "^5.33.15",
+    "tar": "^7.5.22",
+    "wrap-ansi": "10.0.2",
+    "ws": "^8.22.0"
+  },
+  "optionalDependencies": {
+    "agent-desktop": "1.0.2",
+    "@deskbeacon/win32-arm64": "workspace:*",
+    "@deskbeacon/win32-x64": "workspace:*"
+  }
+}

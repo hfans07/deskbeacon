@@ -1,0 +1,57 @@
+{
+  "$schema": "./apps/server/node_modules/wrangler/config-schema.json",
+  // Deploy-to-Cloudflare entry point. Keep the whole workspace available.
+  // Existing installations using apps/server/wrangler.jsonc keep that config.
+  "name": "deskbeacon",
+  "main": "apps/server/src/index.ts",
+  "compatibility_date": "2026-10-17",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "build": {
+    "command": "pnpm --filter @deskbeacon/protocol build"
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true
+    }
+  },
+  "vars": {
+    "MCP_BASE_URL": " "
+  },
+  "ratelimits": [
+    {
+      "name": "SECURITY_RATE_LIMIT",
+      "namespace_id": "45271",
+      "simple": { "limit": 20, "period": 60 }
+    }
+  ],
+  "assets": {
+    "directory": "./apps/server/public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      // Cloudflare replaces this placeholder with the new account's namespace.
+      "id": "f4e7a0e370bf40288f3f004f552fb245"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DEVICE_SESSIONS",
+        "class_name": "DeviceSession"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DeviceSession"]
+    }
+  ]
+}
